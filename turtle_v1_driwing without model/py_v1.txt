@@ -1,0 +1,117 @@
+import serial
+import time
+import keyboard
+import matplotlib.pyplot as plt
+import numpy as np
+
+# --- CONFIGURATION ---
+OPENCR_PORT = 'COM12'   
+LIDAR_PORT = 'COM13'    
+LIDAR_BAUD = 230400     
+
+print(f"Connecting to OpenCR on {OPENCR_PORT}...")
+ser_motors = serial.Serial(OPENCR_PORT, 115200, timeout=0.01)
+
+print(f"Connecting to LiDAR on {LIDAR_PORT}...")
+ser_lidar = serial.Serial(LIDAR_PORT, LIDAR_BAUD, timeout=0.01)
+
+time.sleep(2)
+print("Connected! Press W, A, S, or D to control. Press 'Q' to quit.")
+
+ser_motors.write(b"180,180\n")
+time.sleep(1)
+left, right = 180, 180
+packet_buffer = bytearray()
+lidar_scan = {}
+last_update_time = time.time()
+
+# --- SETUP MATPLOTLIB (LIVE RADAR) ---
+plt.ion() # Turn on interactive mode
+fig, ax = plt.subplots(subplot_kw={'projection': 'polar'})
+scatter = ax.scatter([], [], s=15, c='red', alpha=0.8) # s is dot size
+
+# Configure the radar look
+ax.set_ylim(0, 4000)                   # Set max distance to 4000mm (4 meters)
+ax.set_theta_zero_location('N')        # Put 0 degrees at the top (Front of robot)
+ax.set_theta_direction(-1)             # Make angles go clockwise
+ax.set_title("Live LDS-01 LiDAR Map", pad=20)
+
+try:
+    while True:
+        # 1. Read and parse LiDAR data
+        if ser_lidar.in_waiting > 0:
+            packet_buffer.extend(ser_lidar.read(ser_lidar.in_waiting))
+            
+            while len(packet_buffer) >= 42:
+                if packet_buffer[0] == 250 and 160 <= packet_buffer[1] <= 219:
+                    packet = packet_buffer[:42]
+                    index = packet[1]
+                    
+                    base_angle = (index - 160) * 6
+                    
+                    for i in range(6):
+                        byte_idx = 6 + (i * 6)
+                        distance = packet[byte_idx] | (packet[byte_idx+1] << 8)
+                        
+                        # Save everything (even zeros) to the raw dictionary
+                        angle = base_angle + i
+                        lidar_scan[angle] = distance
+                            
+                    del packet_buffer[:42]
+                    
+                    # --- LIVE PLOT TRIGGER ---
+                    # Update screen at the end of rotation (0xDB)
+                    current_time = time.time()
+                    if index == 219 and (current_time - last_update_time > 0.2) and len(lidar_scan) > 200:
+                        
+                        angles_rad = []
+                        distances = []
+                        
+                        for angle_deg, dist_mm in lidar_scan.items():
+                            # Filter out the 0mm blind spots just for the visual map
+                            if dist_mm > 0:
+                                angles_rad.append(np.radians(angle_deg))
+                                distances.append(dist_mm)
+                                
+                        # Feed the new X, Y coordinates to the scatter plot
+                        scatter.set_offsets(np.c_[angles_rad, distances])
+                        
+                        # Instantly redraw the window without blocking the script
+                        fig.canvas.draw()
+                        fig.canvas.flush_events()
+                        
+                        # Wipe dictionary exactly as the new spin starts
+                        lidar_scan.clear()
+                        last_update_time = current_time
+
+                else:
+                    del packet_buffer[0]
+
+        # 2. Handle Keyboard Motor Control
+        key_pressed = False
+        if keyboard.is_pressed('w'):
+            left += 3; right += 3; key_pressed = True
+        elif keyboard.is_pressed('s'):
+            left -= 3; right -= 3; key_pressed = True
+        elif keyboard.is_pressed('d'):
+            left -= 3; right += 3; key_pressed = True
+        elif keyboard.is_pressed('a'):
+            left += 3; right -= 3; key_pressed = True
+        elif keyboard.is_pressed('q'):
+            print("\nQuitting...")
+            break
+            
+        if key_pressed:
+            command = f"{left},{right}\n"
+            ser_motors.write(command.encode('utf-8'))
+            time.sleep(0.05) 
+
+except KeyboardInterrupt:
+    pass
+finally:
+    print("\nStopping robot and closing ports...")
+    ser_motors.write(b"0,0\n")
+    ser_motors.close()
+    ser_lidar.close()
+    plt.ioff()
+    plt.close()
